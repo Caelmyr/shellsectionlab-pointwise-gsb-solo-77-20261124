@@ -1,0 +1,23 @@
+name: solo80-sectionlab
+services:
+  desk:
+    build:
+      context: .
+      args:
+        SECTIONLAB_RUNTIME_IMAGE: ${SECTIONLAB_RUNTIME_IMAGE:-python:3.12-slim}
+    image: ${SECTIONLAB_IMAGE:-solo80-sectionlab:1.0}
+    network_mode: bridge
+    environment:
+      OPENBLAS_NUM_THREADS: 1
+      OMP_NUM_THREADS: 1
+    ports:
+      - "127.0.0.1:${SECTIONLAB_PORT:-19992}:8000"
+    volumes:
+      - section-library:/var/lib/sectionlab
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; assert urlopen('http://127.0.0.1:8000/section/health', timeout=3).status == 200"]
+      interval: 3s
+      timeout: 4s
+      retries: 12
+volumes:
+  section-library:
