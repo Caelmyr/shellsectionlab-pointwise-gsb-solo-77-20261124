@@ -94,6 +94,9 @@ th, td { text-align: left; border-bottom: 1px solid var(--rule); padding: 6px 8p
 th { position: sticky; top: 0; background: var(--tint); }
 .table-wrap { max-height: 240px; overflow: auto; border: 1px solid var(--rule); margin: 12px 0; }
 .result-actions { justify-content: flex-start; flex-wrap: wrap; }
+.pairing-note { margin: 12px 0; padding: 10px 12px; border: 1px solid var(--rule); border-radius: 8px; background: #f0f7f2; }
+.pairing-note h3 { margin: 0 0 6px; font-size: .98rem; }
+.pairing-note p { font-size: .88rem; margin-top: 4px; }
 @media (max-width: 1040px) {
   .desk { grid-template-columns: 185px minmax(0, 1fr); }
   .main-grid { grid-template-columns: minmax(0, 1fr); }

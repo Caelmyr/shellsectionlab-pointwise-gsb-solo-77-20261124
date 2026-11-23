@@ -3,6 +3,7 @@ import math
 
 import cv2 as cv
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from image_lab.validation import Invalid
 
@@ -120,16 +121,33 @@ def lamina_spacing(frame, marks, _opts):
             "peaks": len(rows)}, rows, shown
 
 
-def pore_map(frame, marks, opts):
-    """Separate compact pore candidates from elongated dark features."""
-    area = selection(frame, marks["region"])
-    cutoff = number(opts.get("luma", .31), "dark pore threshold", .05, .95)
-    candidates = area & (frame.luma <= cutoff)
+def _contour_polygon(contour, shape, offset=(0, 0)):
+    """Simplify a pixel contour to normalized calibrated-plane vertices."""
+    height, width = shape[:2]
+    perimeter = cv.arcLength(contour.astype(np.float32), True)
+    if perimeter:
+        contour = cv.approxPolyDP(contour, .012 * perimeter, True)
+    vertices = contour.reshape(-1, 2).astype(np.float64) + np.asarray(offset, dtype=np.float64)
+    normalized = np.stack((vertices[:, 0] / (width - 1), vertices[:, 1] / (height - 1)), axis=1)
+    return np.round(normalized, 5).tolist()
+
+
+def polygon_mask(polygon, shape):
+    bitmap = np.zeros(shape[:2], dtype=np.uint8)
+    height, width = shape[:2]
+    vertices = np.rint(np.asarray(polygon) * (width - 1, height - 1)).astype(np.int32)
+    cv.fillPoly(bitmap, [vertices], 1)
+    return bitmap.astype(bool)
+
+
+def detect_pores(frame, area_mask, cutoff):
+    """Compact dark pore components inside a calibrated window, elongated fissures rejected."""
+    candidates = area_mask & (frame.luma <= cutoff)
     count, labels, stats, centroids = cv.connectedComponentsWithStats(candidates.astype(np.uint8), connectivity=8)
     pixel_area = frame.step[0] * frame.step[1]
-    rows = []
-    pits = np.zeros(area.shape, dtype=bool)
-    limited = cv.dilate((~area).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    limited = cv.dilate((~area_mask).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    pits = np.zeros(area_mask.shape, dtype=bool)
+    findings = []
     for label in range(1, count):
         x, y, width, height, pixels = stats[label]
         area_mm2 = float(pixels * pixel_area)
@@ -141,17 +159,154 @@ def pore_map(frame, marks, opts):
         footprint = local.astype(np.uint8)
         contours, _ = cv.findContours(footprint, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
         perimeter = sum(cv.arcLength((contour * frame.step).astype(np.float32), True) for contour in contours)
-        rows.append({"area_mm2": round(area_mm2, 4), "center_mm": rounded(centroids[label] * frame.step),
-                     "width_mm": round(horizontal, 4), "height_mm": round(vertical, 4),
-                     "boundary_limited": bool(np.any(local & limited[y:y + height, x:x + width])),
-                     "circularity": round(min(1., 4 * math.pi * area_mm2 / perimeter ** 2), 4) if perimeter else None})
-    rows.sort(key=lambda item: item["area_mm2"], reverse=True)
+        polygon = [point for contour in contours
+                   for point in _contour_polygon(contour, frame.rgb.shape, offset=(x, y))]
+        findings.append({
+            "area_mm2": round(area_mm2, 4), "center_mm": rounded(centroids[label] * frame.step),
+            "width_mm": round(horizontal, 4), "height_mm": round(vertical, 4),
+            "boundary_limited": bool(np.any(local & limited[y:y + height, x:x + width])),
+            "circularity": round(min(1., 4 * math.pi * area_mm2 / perimeter ** 2), 4) if perimeter else None,
+            "polygon": polygon,
+        })
+    findings.sort(key=lambda item: item["area_mm2"], reverse=True)
+    return findings, pits, candidates
+
+
+def pore_map(frame, marks, opts):
+    """Separate compact pore candidates from elongated dark features."""
+    area = selection(frame, marks["region"])
+    cutoff = number(opts.get("luma", .31), "dark pore threshold", .05, .95)
+    rows, pits, candidates = detect_pores(frame, area, cutoff)
     shown = image(frame)
     tint(shown, area & ~candidates, (.25, .78, .73), .22)
     tint(shown, candidates & ~pits, (.65, .36, .83), .44)
     tint(shown, pits, (.95, .48, .24))
+    public_rows = [{key: value for key, value in row.items() if key != "polygon"} for row in rows]
+    pixel_area = frame.step[0] * frame.step[1]
     return {"pore_candidate_count": len(rows), "candidate_area_mm2": round(float(pits.sum() * pixel_area), 4),
-            "observed_mm2": round(float(area.sum() * pixel_area), 4)}, rows[:40], shown
+            "observed_mm2": round(float(area.sum() * pixel_area), 4)}, public_rows[:40], shown
+
+
+def _pore_footprint(finding, shape):
+    return polygon_mask(finding["polygon"], shape)
+
+
+def paired_pore_map(frame, other, marks, opts):
+    """Match the same physical pores across two registered photographs of one section."""
+    if frame.rgb.shape[:2] != other.rgb.shape[:2]:
+        raise Invalid("The two photographs need matching calibrated frame dimensions.")
+    region_a = selection(frame, marks["region"])
+    region_b = selection(other, marks["comparison"])
+    cutoff = number(opts.get("luma", .31), "dark pore threshold", .05, .95)
+    max_center = number(opts.get("max_center_mm", .30), "maximum pore centre separation (mm)", .01, 5)
+    min_overlap = number(opts.get("min_overlap_mm2", .03), "minimum shared pore area (mm²)", .001, 20)
+    pores_a, pits_a, _ = detect_pores(frame, region_a, cutoff)
+    pores_b, pits_b, _ = detect_pores(other, region_b, cutoff)
+    if not pores_a or not pores_b:
+        raise Invalid("Each photograph needs at least one compact dark pore inside its inspection window.")
+    pixel_area = frame.step[0] * frame.step[1]
+    footprints_b = [_pore_footprint(finding, other.rgb.shape) for finding in pores_b]
+    # A legal pair must pass both the centre-separation and shared-area rules; each pore is used once.
+    # Infeasible edges carry a finite penalty far below any feasible one so the assignment still
+    # completes, then only the feasible edges are kept.
+    penalty = -1e9
+    weights = np.full((len(pores_a), len(pores_b)), penalty, dtype=np.float64)
+    metrics = {}
+    for i, pore_a in enumerate(pores_a):
+        footprint_a = _pore_footprint(pore_a, frame.rgb.shape)
+        center_a = np.asarray(pore_a["center_mm"])
+        for j, pore_b in enumerate(pores_b):
+            separation = float(np.linalg.norm(center_a - np.asarray(pore_b["center_mm"])))
+            overlap = float(np.count_nonzero(footprint_a & footprints_b[j]) * pixel_area)
+            if separation <= max_center and overlap >= min_overlap:
+                # Lexicographic rule: most pairs first (feasible edges only), then largest total
+                # shared area, then smallest total centre separation. All ties stay deterministic.
+                weights[i, j] = overlap * 1000.0 - separation
+                metrics[(i, j)] = (overlap, separation)
+    row_index, col_index = linear_sum_assignment(-weights)
+    chosen = [(i, j) for i, j in zip(row_index, col_index) if weights[i, j] > penalty / 2]
+    chosen.sort(key=lambda edge: pores_a[edge[0]]["area_mm2"], reverse=True)
+    paired, paired_masks = [], []
+    used_b = set()
+    for pair_index, (i, j) in enumerate(chosen, 1):
+        overlap, separation = metrics[(i, j)]
+        used_b.add(j)
+        paired_masks.append(_pore_footprint(pores_a[i], frame.rgb.shape) | footprints_b[j])
+        paired.append({
+            "pair": pair_index,
+            "center_reference_mm": pores_a[i]["center_mm"], "center_comparison_mm": pores_b[j]["center_mm"],
+            "center_separation_mm": round(separation, 4),
+            "overlap_mm2": round(overlap, 4),
+            "reference_area_mm2": pores_a[i]["area_mm2"], "comparison_area_mm2": pores_b[j]["area_mm2"],
+            "reference_polygon": pores_a[i]["polygon"], "comparison_polygon": pores_b[j]["polygon"],
+        })
+
+    def unmatched_row(finding, photo_key, counterpart_visible):
+        return {"photo": photo_key, "center_mm": finding["center_mm"], "area_mm2": finding["area_mm2"],
+                "counterpart_visible": bool(counterpart_visible),
+                "status": "Missing evidence" if not counterpart_visible else "Single-photo dark spot",
+                "polygon": finding["polygon"]}
+
+    visible_b = other.useful & region_b
+    unmatched_a, unmatched_masks = [], []
+    matched_a = {i for i, _ in chosen}
+    for i, finding in enumerate(pores_a):
+        if i in matched_a:
+            continue
+        footprint = _pore_footprint(finding, frame.rgb.shape)
+        unmatched_masks.append(footprint)
+        unmatched_a.append(unmatched_row(finding, "reference", bool(np.any(visible_b & footprint))))
+    visible_a = frame.useful & region_a
+    unmatched_b = []
+    for j, finding in enumerate(pores_b):
+        if j in used_b:
+            continue
+        footprint = footprints_b[j]
+        unmatched_masks.append(footprint)
+        unmatched_b.append(unmatched_row(finding, "comparison", bool(np.any(visible_a & footprint))))
+
+    def polygon_pack(items):
+        return [{"center_mm": item["center_mm"], "area_mm2": item["area_mm2"], "polygon": item["polygon"],
+                 "status": item["status"], "counterpart_visible": item["counterpart_visible"]}
+                for item in items]
+
+    shown = image(frame)
+    window = region_a | region_b
+    tint(shown, window & ~(pits_a | pits_b), (.25, .78, .73), .20)
+    tint(shown, pits_a, (.95, .48, .24), .42)
+    tint(shown, pits_b, (.55, .47, .92), .34)
+    for mask in unmatched_masks:
+        tint(shown, mask, (.72, .30, .28), .50)
+    for mask in paired_masks:
+        tint(shown, mask, (.20, .82, .56), .55)
+    summary = {
+        "paired_pore_count": len(paired),
+        "reference_candidates": len(pores_a), "comparison_candidates": len(pores_b),
+        "reference_unmatched": len(unmatched_a), "comparison_unmatched": len(unmatched_b),
+        "missing_evidence": sum(1 for row in unmatched_a + unmatched_b
+                                if row["status"] == "Missing evidence"),
+        "single_photo_dark_spots": sum(1 for row in unmatched_a + unmatched_b
+                                       if row["status"] == "Single-photo dark spot"),
+        "max_center_mm": max_center, "min_overlap_mm2": min_overlap,
+        "mean_center_separation_mm": round(
+            float(np.mean([row["center_separation_mm"] for row in paired])) if paired else 0., 4),
+        "mean_overlap_mm2": round(float(np.mean([row["overlap_mm2"] for row in paired])) if paired else 0., 4),
+    }
+    pairing = {
+        "rule": "Maximum number of one-to-one pairs, then maximum total shared area, then minimum total centre separation.",
+        "max_center_mm": max_center, "min_overlap_mm2": min_overlap,
+        "pairs": paired,
+        "reference_unmatched": polygon_pack(unmatched_a),
+        "comparison_unmatched": polygon_pack(unmatched_b),
+    }
+
+    def public_row(item):
+        return {key: value for key, value in item.items() if not key.endswith("polygon")}
+
+    table_rows = [public_row(item) for item in paired]
+    table_rows.extend(public_row(item) for item in unmatched_a)
+    table_rows.extend(public_row(item) for item in unmatched_b)
+    return summary, table_rows, shown, pairing
 
 
 def growth_transition(frame, marks, opts):
@@ -217,6 +372,100 @@ def pore_intercept(frame, marks, opts):
     dark_length = float(widths[dark].sum())
     return {"observed_mm": round(observed_length, 4), "dark_mm": round(dark_length, 4),
             "unknown_mm": round(length - observed_length, 4)}, rows, overlay
+
+
+def _survey_samples(frame, marks):
+    ends = coordinates(marks["line"]["points"], frame.rgb.shape)
+    length = float(np.linalg.norm((ends[1] - ends[0]) * frame.step))
+    if length < 1:
+        raise Invalid("Use a survey line at least 1 mm long.")
+    count = min(2400, max(20, int(np.ceil(length / min(frame.step))) + 1))
+    line = np.linspace(ends[0], ends[1], count, dtype=np.float32)
+    widths = np.diff(np.linspace(0, length, count + 1))
+    x = line[:, 0].reshape(1, -1)
+    y = line[:, 1].reshape(1, -1)
+    brightness = cv.remap(frame.luma, x, y, cv.INTER_LINEAR)[0]
+    observed = cv.remap(frame.useful.astype(np.float32), x, y, cv.INTER_LINEAR)[0] >= .999
+    return ends, line, widths, length, brightness, observed
+
+
+def paired_pore_intercept(frame, marks, opts, pairing):
+    """Measure which adopted paired pores a survey line actually crosses, with single-photo and missing entries."""
+    shape = frame.rgb.shape
+    ends, line, widths, length, brightness, observed = _survey_samples(frame, marks)
+    threshold = number(opts.get("luma", .31), "dark pore threshold", .05, .95)
+    dark = observed & (brightness <= threshold)
+    clear = observed & ~dark
+    states = np.select([dark, clear], [1, 2])
+    names = ("Not observed", "Dark intercept", "Clear section")
+    colors = ((.42, .45, .53), (.97, .51, .32), (.30, .77, .63))
+    boundaries = np.r_[0, np.flatnonzero(states[1:] != states[:-1]) + 1, len(line)]
+    start_end = np.linspace(0, length, len(line) + 1)
+    rows = []
+    overlay = image(frame)
+    for left, right in zip(boundaries, boundaries[1:]):
+        key = states[left]
+        rows.append({"classification": names[key], "from_mm": round(float(start_end[left]), 4),
+                     "to_mm": round(float(start_end[right]), 4)})
+        a = tuple(np.rint(line[left]).astype(int))
+        b = tuple(np.rint(line[right - 1]).astype(int))
+        cv.line(overlay, a, b, colors[key], 2, cv.LINE_AA)
+
+    sample_xy = np.rint(line).astype(int)
+    flat_index = sample_xy[:, 1] * shape[1] + sample_xy[:, 0]
+
+    def crossing_length(polygon):
+        mask = polygon_mask(polygon, shape)
+        inside = mask.reshape(-1)[flat_index]
+        return float(widths[inside].sum()), inside
+
+    crossed_pairs, crossed_masks = [], []
+    for item in pairing["pairs"]:
+        run_length, inside = crossing_length(item["reference_polygon"])
+        if run_length <= 0:
+            continue
+        hit = np.flatnonzero(inside)
+        crossed_pairs.append({
+            "entry": "Adopted paired pore", "pair": item["pair"],
+            "from_mm": round(float(start_end[hit[0]]), 4),
+            "to_mm": round(float(start_end[hit[-1] + 1]), 4),
+            "crossing_mm": round(run_length, 4),
+            "center_separation_mm": item["center_separation_mm"], "overlap_mm2": item["overlap_mm2"],
+        })
+        crossed_masks.append(polygon_mask(item["reference_polygon"], shape))
+
+    single_rows, missing_rows = [], []
+    for item in pairing.get("reference_unmatched", []):
+        run_length, inside = crossing_length(item["polygon"])
+        if run_length <= 0:
+            continue
+        hit = np.flatnonzero(inside)
+        record = {"entry": item.get("status", "Single-photo dark spot"),
+                  "center_mm": item["center_mm"], "area_mm2": item["area_mm2"],
+                  "from_mm": round(float(start_end[hit[0]]), 4),
+                  "to_mm": round(float(start_end[hit[-1] + 1]), 4),
+                  "crossing_mm": round(run_length, 4)}
+        (missing_rows if record["entry"] == "Missing evidence" else single_rows).append(record)
+
+    for mask in crossed_masks:
+        tint(overlay, mask, (.20, .82, .56), .38)
+    cv.line(overlay, tuple(np.rint(ends[0]).astype(int)), tuple(np.rint(ends[1]).astype(int)),
+            (.98, .93, .36), 1, cv.LINE_AA)
+    rows.extend(crossed_pairs)
+    rows.extend(single_rows)
+    rows.extend(missing_rows)
+    summary = {
+        "observed_mm": round(float(widths[observed].sum()), 4),
+        "dark_mm": round(float(widths[dark].sum()), 4),
+        "unknown_mm": round(length - float(widths[observed].sum()), 4),
+        "length_mm": round(length, 4),
+        "adopted_pores_crossed": len(crossed_pairs),
+        "adopted_crossing_mm": round(sum(row["crossing_mm"] for row in crossed_pairs), 4),
+        "single_photo_crossings": len(single_rows),
+        "missing_evidence_crossings": len(missing_rows),
+        "pairing_pairs_available": len(pairing["pairs"]),
+    }
+    return summary, rows, overlay
 
 
 def landmark_offsets(frame, other, marks, _opts):

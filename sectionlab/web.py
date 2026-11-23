@@ -15,7 +15,9 @@ MEASUREMENTS = {
     "inclusion-fraction": (analysis.inclusion_fraction, {"region": "decor", "matrix": "matrix", "accent": "accent"}, {}),
     "lamina-spacing": (analysis.lamina_spacing, {"region": "repeat"}, {}),
     "pore-map": (analysis.pore_map, {"region": "pore"}, {}),
+    "pore-pair-map": (analysis.paired_pore_map, {"region": "pore"}, {"comparison": "pore"}),
     "pore-intercept": (analysis.pore_intercept, {"line": "stroke"}, {}),
+    "paired-pore-intercept": (analysis.paired_pore_intercept, {"line": "stroke"}, {}),
     "growth_transition": (analysis.growth_transition, {"line": "stroke"}, {}),
     "landmark-offset": (analysis.landmark_offsets, {"reference": "register"}, {"comparison": "register"}),
     "polar-response": (analysis.polar_response, {"matte": "matte", "gloss": "gloss", "decor": "decor"}, {}),
@@ -23,11 +25,15 @@ MEASUREMENTS = {
     "surface-marks": (analysis.surface_marks, {"region": "inspect"}, {}),
     "color-drift": (analysis.color_drift, {"region": "inspect"}, {}),
 }
-PAIRED = {"landmark-offset", "polar-response", "paired-coverage", "color-drift"}
+PAIRED = {"landmark-offset", "polar-response", "paired-coverage", "color-drift", "pore-pair-map"}
 OPTIONS = {
     "inclusion-fraction": {"threshold": ["Inclusion likeness threshold", .5, .01]},
     "pore-map": {"luma": ["Dark pore threshold", .31, .01]},
+    "pore-pair-map": {"luma": ["Dark pore threshold", .31, .01],
+                      "max_center_mm": ["Maximum pore centre separation (mm)", .30, .01],
+                      "min_overlap_mm2": ["Minimum shared pore area (mm²)", .03, .001]},
     "pore-intercept": {"luma": ["Dark pore threshold", .31, .01]},
+    "paired-pore-intercept": {"luma": ["Dark pore threshold", .31, .01]},
     "surface-marks": {"contrast": ["Spot contrast", .075, .005], "minimum_mm2": ["Minimum area (mm²)", .15, .01]},
     "color-drift": {"delta_e": ["Color difference threshold", 5, .1]},
 }
@@ -66,14 +72,35 @@ def measure(library, run, data):
         other_frame = sample_frame(library, run, other)
         read_marks(other_roles, other)
         used.append(other)
-        summary, rows, pixels = work(source_frame, other_frame, selected, options)
+        if mode == "pore-pair-map":
+            summary, rows, pixels, pairing = work(source_frame, other_frame, selected, options)
+            pairing["reference_photo"] = source["id"]
+            pairing["comparison_photo"] = other["id"]
+        else:
+            summary, rows, pixels = work(source_frame, other_frame, selected, options)
+    elif mode == "paired-pore-intercept":
+        record = locate(run["readings"], data.get("pairing"), "The paired pore map reading")
+        if record["mode"] != "pore-pair-map":
+            raise Invalid("Select a saved paired pore map reading as the pore pairing.")
+        pairing = library.reading(run, record["id"])["pairing"]
+        if pairing["reference_photo"] != source["id"]:
+            raise Invalid("The survey line must belong to the reference photograph of the selected pairing.")
+        if source_frame.rgb.shape[:2] != sample_frame(
+                library, run, locate(run["photos"], pairing["comparison_photo"], "The comparison photograph")).rgb.shape[:2]:
+            raise Invalid("The paired photographs no longer share a calibrated frame size.")
+        summary, rows, pixels = work(source_frame, selected, options, pairing)
     else:
         summary, rows, pixels = work(source_frame, selected, options)
-    return {
+    result = {
         "mode": mode, "title": READINGS[mode][0], "summary": summary, "rows": rows, "photos": used,
         "options": options, "marks": selected, "sheet_mm": [run["width_mm"], run["height_mm"]],
         "source_revision": run["revision"], "overlay": library.keep(photos.png(pixels)),
     }
+    if mode == "pore-pair-map":
+        result["pairing"] = pairing
+    if mode == "paired-pore-intercept":
+        result["pairing_ref"] = record["id"]
+    return result
 
 
 def install(app, root):

@@ -381,6 +381,8 @@ function measurement() {
   const source = activePhoto();
   const comparison = select("other", state.run.photos.filter((item) => item.id !== source.id && item.corners)
     .map((item) => [item.id, item.title]));
+  const pairing = select("pairing", state.run.readings.filter((item) => item.mode === "pore-pair-map")
+    .map((item) => [item.id, item.title + " / " + new Date(item.recorded).toLocaleString()]));
   let controls = {};
   let options = {};
 
@@ -391,6 +393,9 @@ function measurement() {
     hint.textContent = spec.help;
     fields.replaceChildren();
     if (spec.paired) fields.append(field("Comparison photograph", comparison));
+    if (operation.value === "paired-pore-intercept") {
+      fields.append(field("Adopted pore pairing / saved paired pore map", pairing));
+    }
     function addMarks(specification, photo) {
       for (const [key, type] of Object.entries(specification)) {
         const entries = state.run.marks.filter((mark) => mark.purpose === type && mark.photo === photo);
@@ -415,13 +420,18 @@ function measurement() {
   open("Take reading", form("Save reading", async () => {
     const readingType = available[operation.value];
     if (readingType.paired && !comparison.value) throw new Error("Add a second calibrated photograph first.");
+    if (operation.value === "paired-pore-intercept" && !pairing.value) {
+      throw new Error("Save a paired pore map reading first, then select it as the adopted pairing.");
+    }
     if (Object.values(controls).some((control) => !control.value)) throw new Error("Mark the required references first.");
-    const result = await api(runURL() + "/readings", "POST", {
+    const payload = {
       revision: state.run.revision, mode: operation.value, photo: source.id,
       other: comparison.value,
       marks: Object.fromEntries(Object.entries(controls).map(([key, control]) => [key, control.value])),
       options: Object.fromEntries(Object.entries(options).map(([key, control]) => [key, control.valueAsNumber])),
-    });
+    };
+    if (operation.value === "paired-pore-intercept") payload.pairing = pairing.value;
+    const result = await api(runURL() + "/readings", "POST", payload);
     replaceRun(result.run);
     openReading(result.reading);
   }, field("Reading", operation), hint, fields));
@@ -464,6 +474,22 @@ function openReading(reading) {
   links.className = "result-actions";
   links.append(link("Download CSV", url + "/csv"), link("Download evidence packet", url + "/packet"));
   pane.append(hero);
+  if (reading.pairing) {
+    const pairing = element("section");
+    pairing.className = "pairing-note";
+    pairing.append(element("h3", "Adopted pore pairing"));
+    pairing.append(element("p", reading.pairing.rule));
+    const criteria = element("p");
+    criteria.textContent = "Centre separation ≤ " + reading.pairing.max_center_mm
+      + " mm; shared area ≥ " + reading.pairing.min_overlap_mm2 + " mm²; each dark pore used at most once.";
+    pairing.append(criteria);
+    pane.append(pairing);
+  }
+  if (reading.pairing_ref) {
+    const ref = element("p", "Based on the saved paired pore map reading " + reading.pairing_ref + ". The pairing itself is unchanged.");
+    ref.className = "pairing-note";
+    pane.append(ref);
+  }
   if (reading.rows.length) pane.append(table(reading.rows));
   pane.append(links);
   open(reading.title, pane);
