@@ -391,6 +391,14 @@ function measurement() {
     hint.textContent = spec.help;
     fields.replaceChildren();
     if (spec.paired) fields.append(field("Comparison photograph", comparison));
+    if (operation.value === "corrected-color-drift") {
+      const adjustments = state.run.readings.filter((item) => item.mode === "landmark-adjust");
+      const adjuster = select("adjustment", adjustments.map((item) => [item.id, item.title + " · " + new Date(item.recorded).toLocaleString()]));
+      adjuster.required = true;
+      if (!adjustments.length) hint.textContent = spec.help + " Save a paired landmark adjustment for this photograph pair first.";
+      fields.append(field("Paired landmark adjustment", adjuster));
+      controls.adjustment = adjuster;
+    }
     function addMarks(specification, photo) {
       for (const [key, type] of Object.entries(specification)) {
         const entries = state.run.marks.filter((mark) => mark.purpose === type && mark.photo === photo);
@@ -419,7 +427,10 @@ function measurement() {
     const result = await api(runURL() + "/readings", "POST", {
       revision: state.run.revision, mode: operation.value, photo: source.id,
       other: comparison.value,
-      marks: Object.fromEntries(Object.entries(controls).map(([key, control]) => [key, control.value])),
+      adjustment: controls.adjustment?.value,
+      marks: Object.fromEntries(Object.entries(controls)
+        .filter(([key]) => key !== "adjustment")
+        .map(([key, control]) => [key, control.value])),
       options: Object.fromEntries(Object.entries(options).map(([key, control]) => [key, control.valueAsNumber])),
     });
     replaceRun(result.run);

@@ -11,6 +11,7 @@ from .store import identity, stamp
 WIDTH, HEIGHT = 1040, 650
 CORNERS = [[0, 0], [1, 0], [1, 1], [0, 1]]
 LANDMARKS = [(142, 210), (907, 193), (153, 516), (903, 527)]
+GROWTH_NODES = [(318, 278), (386, 296), (463, 316), (543, 294)]
 CONTROLS = [
     ("Light inner matrix", "matrix", (207, 331, 293, 379)),
     ("Dark inclusion", "accent", (373, 282, 402, 307)),
@@ -72,6 +73,11 @@ def exposed_section(role, shift, seed):
         cv.circle(rgba, (x0 + shift[0], y0 + shift[1]), radius, (254, 215, 161, 255), -1, cv.LINE_AA)
     for idx,(x0,y0) in enumerate(LANDMARKS):
         cv.drawMarker(rgba, (x0 + shift[0] + idx % 2, y0 + shift[1]), (75, 43, 55, 255), cv.MARKER_CROSS, 13, 2)
+    for idx,(x0,y0) in enumerate(GROWTH_NODES):
+        node = (x0 + shift[0], y0 + shift[1])
+        cv.drawMarker(rgba, node, (40, 33, 78, 255), cv.MARKER_DIAMOND, 15, 2)
+        cv.putText(rgba, str(idx + 1), (node[0] + 8, node[1] - 8),
+                   cv.FONT_HERSHEY_SIMPLEX, .5, (40, 33, 78, 255), 1, cv.LINE_AA)
     if role == "face":
         rgba[488:517, 724:768] = 0
     elif role == "cross":
@@ -97,6 +103,9 @@ def create(library):
             ("Through an observed pore", "stroke", normalized([(215,413),(265,413)])),
             ("Corresponding section landmarks", "register", normalized([
                 (x + shift[0] + i % 2, y + shift[1]) for i,(x,y) in enumerate(LANDMARKS)
+            ])),
+            ("Four matched growth nodes", "register", normalized([
+                (x + shift[0], y + shift[1]) for x, y in GROWTH_NODES
             ])),
         ])
         for title,purpose,points in items:

@@ -22,10 +22,12 @@ READINGS = {
     "pore-intercept": ("Line pore intercept", "Measure observed clear, dark and missing intervals on a calibrated line."),
     "growth_transition": ("Growth boundary transition", "Measure the 10–90% transition along a marked cross section."),
     "landmark-offset": ("Section landmark offsets", "Compare positions of the same landmarks between two images."),
+    "landmark-adjust": ("Paired landmark adjustment", "Fit rotation/translation and uniform-scale corrections from matched landmarks, then adopt one within residual and scale limits."),
     "polar-response": ("Polarization response", "Normalize the observed brightness change against low- and high-response witnesses."),
     "paired-coverage": ("Paired section visibility", "See usable and missing positions in two independently registered photographs."),
     "surface-marks": ("Local alteration map", "Find local mottling or highlights on one view."),
     "color-drift": ("Registered color difference", "Measure Lab differences only at positions visible in both photographs."),
+    "corrected-color-drift": ("Corrected registered color difference", "Apply a saved paired landmark adjustment, then measure Lab differences while marking positions missing evidence in the comparison photograph."),
 }
 POINT_MARKS = {"register", "stroke"}
 IDENTITY = re.compile(r"^[0-9a-f]{24}$")

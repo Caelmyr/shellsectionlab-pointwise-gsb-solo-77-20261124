@@ -5,7 +5,7 @@ from flask import Blueprint, Response, jsonify, render_template, request, send_f
 
 from image_lab.validation import Conflict, Invalid
 
-from . import analysis, demo, evidence, photos
+from . import adjustment, analysis, demo, evidence, photos
 from .model import MARKS, READINGS, ROLES, choice, locate, mark_fields, obj, run_fields, text
 from .store import Library, identity, stamp
 
@@ -18,18 +18,26 @@ MEASUREMENTS = {
     "pore-intercept": (analysis.pore_intercept, {"line": "stroke"}, {}),
     "growth_transition": (analysis.growth_transition, {"line": "stroke"}, {}),
     "landmark-offset": (analysis.landmark_offsets, {"reference": "register"}, {"comparison": "register"}),
+    "landmark-adjust": (adjustment.landmark_adjust, {"reference": "register"}, {"comparison": "register"}),
     "polar-response": (analysis.polar_response, {"matte": "matte", "gloss": "gloss", "decor": "decor"}, {}),
     "paired-coverage": (analysis.paired_coverage, {"region": "inspect"}, {}),
     "surface-marks": (analysis.surface_marks, {"region": "inspect"}, {}),
     "color-drift": (analysis.color_drift, {"region": "inspect"}, {}),
+    "corrected-color-drift": (adjustment.corrected_color_drift, {"region": "inspect"}, {}),
 }
-PAIRED = {"landmark-offset", "polar-response", "paired-coverage", "color-drift"}
+PAIRED = {"landmark-offset", "landmark-adjust", "polar-response", "paired-coverage",
+          "color-drift", "corrected-color-drift"}
 OPTIONS = {
     "inclusion-fraction": {"threshold": ["Inclusion likeness threshold", .5, .01]},
     "pore-map": {"luma": ["Dark pore threshold", .31, .01]},
     "pore-intercept": {"luma": ["Dark pore threshold", .31, .01]},
     "surface-marks": {"contrast": ["Spot contrast", .075, .005], "minimum_mm2": ["Minimum area (mm²)", .15, .01]},
     "color-drift": {"delta_e": ["Color difference threshold", 5, .1]},
+    "corrected-color-drift": {"delta_e": ["Color difference threshold", 5, .1]},
+    "landmark-adjust": {
+        "max_residual_mm": ["Maximum remaining landmark deviation (mm)", 1, .05],
+        "max_scale_pct": ["Allowed uniform scale change (%)", 2, .1],
+    },
 }
 
 
@@ -64,16 +72,53 @@ def measure(library, run, data):
         if other["id"] == source["id"]:
             raise Invalid("Choose a different comparison photograph.")
         other_frame = sample_frame(library, run, other)
+        applied_correction = None
+        if mode == "corrected-color-drift":
+            adjustment_id = data.get("adjustment")
+            if not isinstance(adjustment_id, str):
+                raise Invalid("Select the saved paired landmark adjustment to apply.")
+            adjustment_row = next((row for row in run["readings"]
+                                   if row["id"] == adjustment_id and row["mode"] == "landmark-adjust"), None)
+            if adjustment_row is None:
+                raise Invalid("Select a saved paired landmark adjustment from this run.")
+            record = library.reading(run, adjustment_id)
+            applied_correction = adjustment.load_correction(
+                record, source, other, source_frame, other_frame)
         read_marks(other_roles, other)
         used.append(other)
-        summary, rows, pixels = work(source_frame, other_frame, selected, options)
+        if applied_correction is not None:
+            options["_correction"] = applied_correction
+        result = work(source_frame, other_frame, selected, options)
     else:
-        summary, rows, pixels = work(source_frame, selected, options)
-    return {
+        result = work(source_frame, selected, options)
+    result = list(result)
+    if len(result) == 4:
+        summary, rows, pixels, correction = result
+        options.pop("_correction", None)
+    else:
+        summary, rows, pixels = result
+        correction = None
+    if mode == "corrected-color-drift":
+        # Persist the exact applied geometry and the reading it was adopted from,
+        # so the narrow-band result can be reopened and rechecked independently.
+        correction = {
+            "adjustment_reading_id": adjustment_id,
+            "adopted": applied_correction["adopted"],
+            "reason": applied_correction["reason"],
+            "thresholds": applied_correction["thresholds"],
+            "frame": applied_correction["frame"],
+            "candidates": applied_correction["candidates"],
+            "matrix_px": applied_correction["matrix_px"],
+        }
+    saved_options = {key: value for key, value in options.items() if not key.startswith("_")}
+    document = {
         "mode": mode, "title": READINGS[mode][0], "summary": summary, "rows": rows, "photos": used,
-        "options": options, "marks": selected, "sheet_mm": [run["width_mm"], run["height_mm"]],
+        "options": saved_options, "marks": selected, "sheet_mm": [run["width_mm"], run["height_mm"]],
         "source_revision": run["revision"], "overlay": library.keep(photos.png(pixels)),
     }
+    if correction is not None:
+        document["correction"] = correction
+    return document
 
 
 def install(app, root):
