@@ -24,10 +24,19 @@ MEASUREMENTS = {
     "color-drift": (analysis.color_drift, {"region": "inspect"}, {}),
 }
 PAIRED = {"landmark-offset", "polar-response", "paired-coverage", "color-drift"}
+EDGE_LINKED = {"lamina-spacing"}
 OPTIONS = {
     "inclusion-fraction": {"threshold": ["Inclusion likeness threshold", .5, .01]},
     "pore-map": {"luma": ["Dark pore threshold", .31, .01]},
     "pore-intercept": {"luma": ["Dark pore threshold", .31, .01]},
+    "growth_transition": {
+        "contrast": ["Local contrast lower limit", .07, .01],
+        "width_min": ["Minimum transition width (mm)", .3, .05],
+        "width_max": ["Maximum transition width (mm)", 30, .5],
+        "prefer": {"label": "Adopt the edge by", "initial": "narrow",
+                   "choices": [["narrow", "Narrowest usable transition"],
+                               ["contrast", "Strongest flank contrast"]]},
+    },
     "surface-marks": {"contrast": ["Spot contrast", .075, .005], "minimum_mm2": ["Minimum area (mm²)", .15, .01]},
     "color-drift": {"delta_e": ["Color difference threshold", 5, .1]},
 }
@@ -39,6 +48,22 @@ def input_json():
 
 def sample_frame(library, run, photo):
     return photos.plane({**photo, "pixels": photos.decode(library.blob(photo["blob"]).read_bytes())}, run)
+
+
+def edge_reference(library, run, reference):
+    if reference is None:
+        return None
+    saved = library.reading(run, reference)
+    if saved["mode"] != "growth_transition":
+        raise Invalid("Choose a saved growth boundary transition as the edge reference.")
+    summary = saved.get("summary", {})
+    line = saved.get("marks", {}).get("line", {})
+    origin = summary.get("edge_origin_mm")
+    if (isinstance(origin, bool) or not isinstance(origin, (int, float))
+            or summary.get("light_side") not in ("start", "end") or not line.get("points")):
+        raise Invalid("Save a fresh growth boundary transition before using it as the edge reference.")
+    return {"id": saved["id"], "origin_mm": float(origin),
+            "light_side": summary["light_side"], "points": line["points"]}
 
 
 def measure(library, run, data):
@@ -67,6 +92,9 @@ def measure(library, run, data):
         read_marks(other_roles, other)
         used.append(other)
         summary, rows, pixels = work(source_frame, other_frame, selected, options)
+    elif mode in EDGE_LINKED:
+        summary, rows, pixels = work(source_frame, selected, options,
+                                     edge_reference(library, run, data.get("edge")))
     else:
         summary, rows, pixels = work(source_frame, selected, options)
     return {
@@ -94,7 +122,7 @@ def install(app, root):
         for mode, (title, help_text) in READINGS.items():
             _, source_roles, other_roles = MEASUREMENTS[mode]
             definitions[mode] = {"title": title, "help": help_text, "reference": source_roles, "comparison": other_roles,
-                                 "paired": mode in PAIRED, "options": OPTIONS.get(mode, {})}
+                                 "paired": mode in PAIRED, "edge": mode in EDGE_LINKED, "options": OPTIONS.get(mode, {})}
         return jsonify(readings=definitions, marks=MARKS, roles=ROLES)
 
     @api.get("/runs")

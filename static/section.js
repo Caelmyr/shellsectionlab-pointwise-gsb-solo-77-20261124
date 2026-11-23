@@ -383,11 +383,13 @@ function measurement() {
     .map((item) => [item.id, item.title]));
   let controls = {};
   let options = {};
+  let edgeControl = null;
 
   function rebuild() {
     const spec = available[operation.value];
     controls = {};
     options = {};
+    edgeControl = null;
     hint.textContent = spec.help;
     fields.replaceChildren();
     if (spec.paired) fields.append(field("Comparison photograph", comparison));
@@ -402,10 +404,24 @@ function measurement() {
     }
     addMarks(spec.reference, source.id);
     addMarks(spec.comparison, comparison.value);
-    for (const [key, [name, initial, step]] of Object.entries(spec.options)) {
-      const value = input(key, "number", initial, { step, required: true });
-      options[key] = value;
-      fields.append(field(name, value));
+    if (spec.edge) {
+      const saved = state.run.readings.filter((item) => item.mode === "growth_transition")
+        .map((item) => [item.id, item.title + " / " + new Date(item.recorded).toLocaleString()]);
+      edgeControl = select("edge", [["", "No linked growth edge"], ...saved]);
+      fields.append(field("Adopted growth edge (optional)", edgeControl));
+    }
+    for (const [key, setting] of Object.entries(spec.options)) {
+      if (Array.isArray(setting)) {
+        const [name, initial, step] = setting;
+        const value = input(key, "number", initial, { step, required: true });
+        options[key] = () => value.valueAsNumber;
+        fields.append(field(name, value));
+      } else {
+        const widget = select(key, setting.choices);
+        widget.value = setting.initial;
+        options[key] = () => widget.value;
+        fields.append(field(setting.label, widget));
+      }
     }
   }
 
@@ -420,7 +436,8 @@ function measurement() {
       revision: state.run.revision, mode: operation.value, photo: source.id,
       other: comparison.value,
       marks: Object.fromEntries(Object.entries(controls).map(([key, control]) => [key, control.value])),
-      options: Object.fromEntries(Object.entries(options).map(([key, control]) => [key, control.valueAsNumber])),
+      options: Object.fromEntries(Object.entries(options).map(([key, read]) => [key, read()])),
+      edge: edgeControl?.value || null,
     });
     replaceRun(result.run);
     openReading(result.reading);

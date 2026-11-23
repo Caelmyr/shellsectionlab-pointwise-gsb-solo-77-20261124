@@ -3,10 +3,12 @@ import math
 
 import cv2 as cv
 import numpy as np
+from scipy.ndimage import uniform_filter1d
+from scipy.signal import find_peaks
 
 from image_lab.validation import Invalid
 
-from .model import number
+from .model import choice, number
 from .photos import coordinates, image, region
 
 
@@ -85,7 +87,7 @@ def inclusion_fraction(frame, marks, opts):
             "threshold": threshold, "pixels": int(area.sum())}, rows, shown
 
 
-def lamina_spacing(frame, marks, _opts):
+def lamina_spacing(frame, marks, _opts, edge=None):
     mask = selection(frame, marks["region"], 250)
     ys, xs = np.nonzero(mask)
     y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
@@ -114,10 +116,84 @@ def lamina_spacing(frame, marks, _opts):
                      "lamina_direction_deg": round((math.degrees(math.atan2(yy[iy, ix], xx[iy, ix])) + 90) % 180, 2),
                      "relative_power": round(strength, 4)})
         candidate[max(0, iy - 3):iy + 4, max(0, ix - 3):ix + 4] = 0
+    summary = {"dominant_spacing_mm": rows[0]["spacing_mm"], "dominant_lamina_deg": rows[0]["lamina_direction_deg"],
+               "peaks": len(rows)}
     shown = image(frame)
     tint(shown, mask, (.52, .79, .91), .22)
-    return {"dominant_spacing_mm": rows[0]["spacing_mm"], "dominant_lamina_deg": rows[0]["lamina_direction_deg"],
-            "peaks": len(rows)}, rows, shown
+    if edge is not None:
+        summary.update(light_side_pair(frame, mask, edge, rows[0]["spacing_mm"], shown))
+    return summary, rows, shown
+
+
+def light_side_pair(frame, mask, edge, spacing, shown):
+    """Verify the first continuously readable lamina pair past the adopted growth edge.
+
+    Only the transect interval from the adopted 90% position toward the light
+    side is read. If the first two lamina crests are separated by an unreadable
+    segment, the pair is reported missing instead of borrowing laminae from
+    elsewhere or the patch-wide spacing.
+    """
+    knots = coordinates(edge["points"], frame.rgb.shape)
+    full = float(np.linalg.norm((knots[1] - knots[0]) * frame.step))
+    origin = min(max(edge["origin_mm"], 0.), full)
+    forward = edge["light_side"] == "end"
+    span = full - origin if forward else origin
+    if span < .5:
+        raise Invalid("The adopted edge leaves no readable length on the light side of the transect.")
+    count = min(2400, max(20, int(np.ceil(span / min(frame.step))) + 1))
+    ts = np.linspace(origin, full if forward else 0., count)
+    step_mm = span / (count - 1)
+    points = knots[0] + (ts / full)[:, None] * (knots[1] - knots[0])
+    xs = points[:, 0].reshape(1, -1).astype(np.float32)
+    ys = points[:, 1].reshape(1, -1).astype(np.float32)
+    brightness = cv.remap(frame.luma, xs, ys, cv.INTER_LINEAR)[0]
+    observed = cv.remap(frame.useful.astype(np.float32), xs, ys, cv.INTER_LINEAR)[0] >= .999
+    inside = cv.remap(mask.astype(np.float32), xs, ys, cv.INTER_LINEAR)[0] >= .999
+    readable = observed & inside
+    if not readable[0]:
+        raise Invalid("The marked lamina patch must cover the transect at the adopted edge.")
+    smoothed = np.convolve(np.pad(brightness, 2, mode="edge"), np.full(5, .2), mode="valid")
+    window = max(9, int(round(2.5 * spacing / step_mm)) | 1)
+    distance = max(2, int(round(.45 * spacing / step_mm)))
+    peaks = []
+    boundaries = np.r_[0, np.flatnonzero(readable[1:] != readable[:-1]) + 1, count]
+    for left, right in zip(boundaries, boundaries[1:]):
+        if not readable[left] or right - left < 5:
+            continue
+        piece = smoothed[left:right]
+        detrended = piece - uniform_filter1d(piece, size=min(window, piece.size))
+        spread = float(np.percentile(detrended, 90) - np.percentile(detrended, 10))
+        local, _ = find_peaks(detrended, prominence=max(.01, .22 * spread), distance=distance)
+        peaks.extend((left + local).tolist())
+    result = {"edge_reading": edge["id"], "edge_origin_mm": round(float(origin), 3),
+              "light_side": edge["light_side"]}
+    first = second = None
+    note = None
+    if len(peaks) >= 2:
+        first, second = peaks[0], peaks[1]
+        if not readable[first:second + 1].all():
+            first = second = None
+            note = "An unreadable segment separates the first two laminae."
+    else:
+        note = "Fewer than two laminae are readable along the light side."
+    if first is None:
+        result.update(first_lamina_mm=None, second_lamina_mm=None, pair_spacing_mm=None, pair_note=note)
+    result["pair_status"] = "missing" if first is None else "verified"
+
+    def spot(at_mm):
+        point = knots[0] + (at_mm / full) * (knots[1] - knots[0])
+        return tuple(np.rint(point).astype(int))
+
+    cv.line(shown, spot(origin), spot(float(ts[-1])), (.96, .52, .27), 2)
+    cv.drawMarker(shown, spot(origin), (.95, .38, .60), cv.MARKER_TILTED_CROSS, 15, 2)
+    if first is not None:
+        d1 = float(abs(ts[first] - origin))
+        d2 = float(abs(ts[second] - origin))
+        result.update(first_lamina_mm=round(d1, 3), second_lamina_mm=round(d2, 3),
+                      pair_spacing_mm=round(d2 - d1, 4))
+        for at in (float(ts[first]), float(ts[second])):
+            cv.drawMarker(shown, spot(at), (.30, .88, .52), cv.MARKER_CROSS, 12, 2)
+    return result
 
 
 def pore_map(frame, marks, opts):
@@ -154,12 +230,68 @@ def pore_map(frame, marks, opts):
             "observed_mm2": round(float(area.sum() * pixel_area), 4)}, rows[:40], shown
 
 
+def rise_episodes(profile, level_tol, drop_tol, stall):
+    """Split an upward-normalized profile into separate continuous rise episodes.
+
+    An episode ends when the profile gives back more than ``drop_tol`` from its
+    running high, or when it stalls near that high for more than ``stall``
+    samples before climbing again (a shelf between two rises).
+    """
+    runs = []
+    start = high = 0
+    since = 0
+    for i in range(1, len(profile)):
+        if profile[i] >= profile[high] + level_tol:
+            if since > stall:
+                runs.append((start, high))
+                start = high
+            high = i
+            since = 0
+        elif profile[i] < profile[high] - drop_tol:
+            runs.append((start, high))
+            start = high
+            high = i
+            since = 0
+        else:
+            since += 1
+    runs.append((start, high))
+    episodes = []
+    for first, last in runs:
+        if last <= first:
+            continue
+        trough = first + int(np.argmin(profile[first:last + 1]))
+        if trough < last:
+            episodes.append((trough, last))
+    return episodes
+
+
+def climbs_steadily(profile, i0, i1, level_tol, stall):
+    """True when [i0, i1] keeps climbing without a halt longer than ``stall``."""
+    high = i0
+    since = 0
+    for i in range(i0 + 1, i1 + 1):
+        if profile[i] >= profile[high] + level_tol:
+            high = i
+            since = 0
+        else:
+            since += 1
+            if since > stall:
+                return False
+    return True
+
+
 def growth_transition(frame, marks, opts):
     knots = coordinates(marks["line"]["points"], frame.rgb.shape)
     length = float(np.linalg.norm((knots[1] - knots[0]) * frame.step))
     if length < 1:
         raise Invalid("Use a transect at least 1 mm long.")
-    count = min(220, max(24, int(length * 5)))
+    contrast = number(opts.get("contrast", .07), "local transition contrast", .02, .6)
+    width_min = number(opts.get("width_min", .3), "minimum transition width", .05, 500)
+    width_max = number(opts.get("width_max", 30), "maximum transition width", .1, 1500)
+    if width_min >= width_max:
+        raise Invalid("The minimum transition width must stay below the maximum.")
+    prefer = choice(opts.get("prefer", "narrow"), ("narrow", "contrast"), "edge adoption preference")
+    count = min(600, max(24, int(length * 5)))
     locations = np.linspace(knots[0], knots[1], count, dtype=np.float32)
     xs, ys = locations.T
     luma = cv.remap(frame.luma, xs.reshape(1, -1), ys.reshape(1, -1), cv.INTER_LINEAR)[0]
@@ -170,17 +302,83 @@ def growth_transition(frame, marks, opts):
     lead, tail = float(np.median(luma[:strip])), float(np.median(luma[-strip:]))
     if abs(tail - lead) < .07:
         raise Invalid("The two ends should fall on visibly different shell tones.")
-    relative = np.convolve(np.pad((luma - lead) / (tail - lead), 2, mode="edge"), np.full(5, .2), mode="valid")
+    sign = 1. if tail >= lead else -1.
+    profile = np.convolve(np.pad((luma - lead) * sign, 2, mode="edge"), np.full(5, .2), mode="valid")
     position = np.linspace(0, length, count)
-    limits = [np.flatnonzero(valid & (relative >= level)) for level in (.1, .9)]
-    if any(len(indices) == 0 for indices in limits):
-        raise Invalid("The transect does not bracket the shell growth transition.")
-    width = float(position[limits[1][0]] - position[limits[0][0]])
+    per_mm = (count - 1) / length
+    level_tol = max(.01, .25 * contrast)
+    # A shelf is a halt longer than the gentlest acceptable rise (contrast over
+    # width_max) needs to climb level_tol; shorter halts stay inside one rise.
+    stall = max(4, min(240, int(round(level_tol * width_max * per_mm / (.8 * contrast)))))
+    episodes = rise_episodes(profile, level_tol, max(.04, .5 * contrast), stall)
+    window = max(4, min(40, int(round(.8 * width_min * per_mm))))
+    least = max(3, window // 2)
+    found = []
+    for trough, high in episodes:
+        amplitude = float(profile[high] - profile[trough])
+        if amplitude < .5 * contrast:
+            continue
+        before = profile[max(0, trough - window):trough + 1]
+        after = profile[high:high + window + 1]
+        clear = (len(before) >= least and len(after) >= least
+                 and valid[max(0, trough - window):trough + 1].all() and valid[high:high + window + 1].all()
+                 and np.percentile(before, 90) - np.percentile(before, 10) <= max(.04, .45 * amplitude)
+                 and np.percentile(after, 90) - np.percentile(after, 10) <= max(.04, .45 * amplitude))
+        dark = float(np.median(before)) if clear else float(profile[trough])
+        light = float(np.median(after)) if clear else float(profile[high])
+        seen = light - dark
+        rise10, rise90 = trough, high
+        continuous = False
+        if seen > 0:
+            low, top = dark + np.array((.1, .9)) * seen
+            segment = profile[trough:high + 1]
+            rise90 = trough + int(np.flatnonzero(segment >= top)[0])
+            below = np.flatnonzero(profile[trough:rise90 + 1] <= low)
+            rise10 = trough + (int(below[-1]) + 1 if len(below) else 0)
+            continuous = (bool(valid[rise10:rise90 + 1].all())
+                          and climbs_steadily(profile, rise10, rise90, level_tol, stall))
+        width = float(position[rise90] - position[rise10])
+        if not clear:
+            status = "plateaus unclear"
+        elif seen < contrast:
+            status = "below contrast limit"
+        elif not continuous:
+            status = "interrupted rise"
+        elif not width_min <= width <= width_max:
+            status = "width outside range"
+        else:
+            status = "usable"
+        found.append({"transition": len(found) + 1, "from_mm": round(float(position[trough]), 3),
+                      "to_mm": round(float(position[high]), 3), "rise_10_mm": round(float(position[rise10]), 3),
+                      "rise_90_mm": round(float(position[rise90]), 3), "width_mm": round(width, 4),
+                      "contrast": round(float(seen), 4), "plateaus": "clear" if clear else "unclear",
+                      "status": status})
+    usable = [item for item in found if item["status"] == "usable"]
+    if not usable:
+        raise Invalid("No local transition on this transect met the contrast and width limits.")
+    if prefer == "narrow":
+        adopted = min(usable, key=lambda item: (item["width_mm"], -item["contrast"]))
+    else:
+        adopted = max(usable, key=lambda item: (item["contrast"], -item["width_mm"]))
+    adopted["status"] = "adopted"
     shown = image(frame)
     cv.line(shown, tuple(np.rint(knots[0]).astype(int)), tuple(np.rint(knots[1]).astype(int)), (.96, .52, .27), 2)
-    rows = [{"position_mm": round(float(x), 3), "luma": round(float(y), 4) if on else None}
-            for x, y, on in zip(position, luma, valid)]
-    return {"edge_width_mm": round(max(0, width), 4), "length_mm": round(length, 4), "usable_samples": int(valid.sum())}, rows, shown
+
+    def spot(at_mm):
+        point = knots[0] + (at_mm / length) * (knots[1] - knots[0])
+        return tuple(np.rint(point).astype(int))
+
+    for item in found:
+        tone = (.30, .72, .95) if item["status"] in ("usable", "adopted") else (.58, .58, .63)
+        cv.circle(shown, spot(item["rise_90_mm"]), 4, tone, 1, cv.LINE_AA)
+    cv.drawMarker(shown, spot(adopted["rise_10_mm"]), (.32, .88, .55), cv.MARKER_CROSS, 12, 2)
+    cv.drawMarker(shown, spot(adopted["rise_90_mm"]), (.95, .38, .60), cv.MARKER_TILTED_CROSS, 15, 2)
+    summary = {"edge_width_mm": adopted["width_mm"], "edge_origin_mm": adopted["rise_90_mm"],
+               "edge_contrast": adopted["contrast"], "edge_preference": prefer,
+               "transitions_found": len(found), "transitions_usable": len(usable),
+               "light_side": "end" if sign > 0 else "start", "length_mm": round(length, 4),
+               "usable_samples": int(valid.sum())}
+    return summary, found, shown
 
 
 def pore_intercept(frame, marks, opts):
