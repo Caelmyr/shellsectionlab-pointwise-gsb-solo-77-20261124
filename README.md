@@ -2,7 +2,7 @@
 
 Compare registered photographs of one cut shell surface. Open the synthetic demonstration to try two polarization views and a macro image. For your own photographs, create a run with the real frame dimensions, upload a PNG, JPEG or TIFF and mark the same four physical corners in each photo. Then mark the samples and take a reading. Reopen saved readings to inspect or download their overlay, values and original photographs.
 
-The analysis desk provides section tone, matrix and inclusion contrast, inclusion fraction, lamina spacing, pore candidates, line pore intercept, growth-boundary transition, landmark offsets, polarization response, paired visibility, local alteration and registered color difference. The linked image preparation room supports independent photo preparation before import.
+The analysis desk provides section tone, matrix and inclusion contrast, inclusion fraction, evidenced inclusion fraction, lamina spacing, pore candidates, line pore intercept, growth-boundary transition, landmark offsets, polarization response, paired visibility, local alteration and registered color difference. The linked image preparation room supports independent photo preparation before import.
 
 The displayed fractions and pore candidates come from image evidence in the selected marks. Color distances use display-referred Lab. The polarization response is relative to the two controls; it does not determine material composition. The calibration assumes a single flat plane and uses at most 1,300 pixels along its long side. Fine features below the resolved image scale should remain uncertain. The sample photographs are generated illustrations.
 

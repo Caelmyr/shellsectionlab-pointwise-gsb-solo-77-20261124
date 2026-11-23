@@ -17,6 +17,7 @@ READINGS = {
     "section-tone": ("Section tone", "Read Lab tone and color variation in an observed patch."),
     "section-contrast": ("Matrix and inclusion contrast", "Compare the shell matrix and inclusion control colors."),
     "inclusion-fraction": ("Inclusion fraction", "Measure visible inclusion-like pixels along the matrix-to-inclusion color axis."),
+    "inclusion-evidence": ("Evidenced inclusion fraction", "Confirm color-suspect inclusions against the polarization pair and bound the fraction."),
     "lamina-spacing": ("Lamina spacing", "Look for regularly spaced growth laminae in a marked patch."),
     "pore-map": ("Pore map", "Locate compact dark pore candidates and separate elongated fissures."),
     "pore-intercept": ("Line pore intercept", "Measure observed clear, dark and missing intervals on a calibrated line."),

@@ -13,6 +13,10 @@ MEASUREMENTS = {
     "section-tone": (analysis.section_tone, {"region": "inspect"}, {}),
     "section-contrast": (analysis.section_contrast, {"matrix": "matrix", "accent": "accent"}, {}),
     "inclusion-fraction": (analysis.inclusion_fraction, {"region": "decor", "matrix": "matrix", "accent": "accent"}, {}),
+    "inclusion-evidence": (analysis.inclusion_evidence, {
+        "matrix": "matrix", "accent": "accent", "region": "decor",
+        "matte_a": "matte", "gloss_a": "gloss", "matte_b": "matte", "gloss_b": "gloss",
+    }, {}),
     "lamina-spacing": (analysis.lamina_spacing, {"region": "repeat"}, {}),
     "pore-map": (analysis.pore_map, {"region": "pore"}, {}),
     "pore-intercept": (analysis.pore_intercept, {"line": "stroke"}, {}),
@@ -23,9 +27,17 @@ MEASUREMENTS = {
     "surface-marks": (analysis.surface_marks, {"region": "inspect"}, {}),
     "color-drift": (analysis.color_drift, {"region": "inspect"}, {}),
 }
-PAIRED = {"landmark-offset", "polar-response", "paired-coverage", "color-drift"}
+PAIRED = {"landmark-offset", "polar-response", "paired-coverage", "color-drift", "inclusion-evidence"}
 OPTIONS = {
     "inclusion-fraction": {"threshold": ["Inclusion likeness threshold", .5, .01]},
+    "inclusion-evidence": {
+        "threshold": ["Inclusion likeness threshold", .5, .01],
+        "minimum_paired": ["Minimum paired pixels per patch", 32, 1],
+        "minimum_contrast": ["Minimum reference contrast", .025, .005],
+        "response_bound": ["Significant response bound", .6, .05],
+        "priority": ["Reference set priority", "separation",
+                     [["separation", "Wider matte-gloss contrast"], ["area", "Larger paired reference area"]]],
+    },
     "pore-map": {"luma": ["Dark pore threshold", .31, .01]},
     "pore-intercept": {"luma": ["Dark pore threshold", .31, .01]},
     "surface-marks": {"contrast": ["Spot contrast", .075, .005], "minimum_mm2": ["Minimum area (mm²)", .15, .01]},

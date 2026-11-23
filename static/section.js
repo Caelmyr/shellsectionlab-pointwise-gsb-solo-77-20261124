@@ -403,7 +403,13 @@ function measurement() {
     addMarks(spec.reference, source.id);
     addMarks(spec.comparison, comparison.value);
     for (const [key, [name, initial, step]] of Object.entries(spec.options)) {
-      const value = input(key, "number", initial, { step, required: true });
+      let value;
+      if (Array.isArray(step)) {
+        value = select(key, step);
+        value.value = initial;
+      } else {
+        value = input(key, "number", initial, { step, required: true });
+      }
       options[key] = value;
       fields.append(field(name, value));
     }
@@ -420,7 +426,9 @@ function measurement() {
       revision: state.run.revision, mode: operation.value, photo: source.id,
       other: comparison.value,
       marks: Object.fromEntries(Object.entries(controls).map(([key, control]) => [key, control.value])),
-      options: Object.fromEntries(Object.entries(options).map(([key, control]) => [key, control.valueAsNumber])),
+      options: Object.fromEntries(Object.entries(options).map(([key, control]) => [
+        key, control.type === "number" ? control.valueAsNumber : control.value,
+      ])),
     });
     replaceRun(result.run);
     openReading(result.reading);

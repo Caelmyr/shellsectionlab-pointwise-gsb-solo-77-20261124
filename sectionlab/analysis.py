@@ -6,7 +6,7 @@ import numpy as np
 
 from image_lab.validation import Invalid
 
-from .model import number
+from .model import choice, number
 from .photos import coordinates, image, region
 
 
@@ -83,6 +83,124 @@ def inclusion_fraction(frame, marks, opts):
     ]
     return {"inclusion_like_area_pct": round(100 * decorated.sum() / area.sum(), 3),
             "threshold": threshold, "pixels": int(area.sum())}, rows, shown
+
+
+def inclusion_evidence(frame, other, marks, opts):
+    """Bound the inclusion fraction by testing color suspects against the polarization pair."""
+    threshold = number(opts.get("threshold", .5), "inclusion likeness threshold", .1, .9)
+    minimum_paired = int(round(number(opts.get("minimum_paired", 32), "minimum paired pixels per patch", 8, 20000)))
+    minimum_contrast = number(opts.get("minimum_contrast", .025), "minimum reference contrast", .005, .5)
+    response_bound = number(opts.get("response_bound", .6), "significant response bound", .05, 4)
+    priority = choice(opts.get("priority", "separation"), ("separation", "area"), "reference set priority")
+    if len({marks[slot]["id"] for slot in ("matte_a", "gloss_a", "matte_b", "gloss_b")}) < 4:
+        raise Invalid("The two reference sets need four distinct witness patches.")
+    usable = frame.useful & other.useful
+    delta = other.luma - frame.luma
+    sets = {}
+    for key in ("a", "b"):
+        witnesses = {}
+        for slot in ("matte", "gloss"):
+            mark = marks[f"{slot}_{key}"]
+            mask = region(frame, mark) & usable
+            paired = int(mask.sum())
+            witnesses[slot] = {
+                "mark": mark, "mask": mask, "paired": paired,
+                "face": float(np.median(frame.luma[mask])) if paired else None,
+                "crossed": float(np.median(other.luma[mask])) if paired else None,
+                "delta": float(np.median(delta[mask])) if paired else None,
+            }
+        matte, gloss = witnesses["matte"], witnesses["gloss"]
+        contrast = None if matte["delta"] is None or gloss["delta"] is None else gloss["delta"] - matte["delta"]
+        qualified = (matte["paired"] >= minimum_paired and gloss["paired"] >= minimum_paired
+                     and contrast is not None and abs(contrast) >= minimum_contrast)
+        sets[key] = {**witnesses, "contrast": contrast, "qualified": qualified,
+                     "paired": matte["paired"] + gloss["paired"]}
+    eligible = [key for key, value in sets.items() if value["qualified"]]
+    if not eligible:
+        raise Invalid("Neither matte/gloss reference set meets the minimum paired pixels and reference contrast.")
+    if len(eligible) == 1:
+        adopted, reason = eligible[0], "Only one reference set met the limits."
+    elif priority == "separation":
+        adopted = max(eligible, key=lambda key: abs(sets[key]["contrast"]))
+        reason = "Both sets qualified; adopted for the wider matte-gloss contrast."
+    else:
+        adopted = max(eligible, key=lambda key: sets[key]["paired"])
+        reason = "Both sets qualified; adopted for the larger paired reference area."
+    chosen = sets[adopted]
+    matte_delta, contrast = chosen["matte"]["delta"], chosen["contrast"]
+    area = selection(frame, marks["region"])
+    likeness = inclusion_projection(frame, marks["matrix"], marks["accent"])
+    suspect = area & (likeness >= threshold)
+    count, labels, stats, centroids = cv.connectedComponentsWithStats(suspect.astype(np.uint8), connectivity=8)
+    kinds = {"evidenced": 1, "responsive": 2, "pending": 3}
+    kind_of = np.zeros(count, dtype=np.int8)
+    spots = []
+    for label in range(1, count):
+        x, y, width, height, pixels = stats[label]
+        local = labels[y:y + height, x:x + width] == label
+        local_paired = local & other.useful[y:y + height, x:x + width]
+        paired = int(local_paired.sum())
+        if paired >= minimum_paired:
+            response = (float(np.median(delta[y:y + height, x:x + width][local_paired])) - matte_delta) / contrast
+            kind = "responsive" if abs(response) >= response_bound else "evidenced"
+        else:
+            response, kind = None, "pending"
+        kind_of[label] = kinds[kind]
+        spots.append({"kind": kind, "pixels": int(pixels), "paired": paired, "response": response,
+                      "size_mm2": float(pixels * frame.step[0] * frame.step[1]),
+                      "center": centroids[label] * frame.step})
+    classified = kind_of[labels]
+    groups = {name: classified == code for name, code in kinds.items()}
+    total = int(area.sum())
+    counts = {name: int(group.sum()) for name, group in groups.items()}
+    suspect_pixels = counts["evidenced"] + counts["responsive"] + counts["pending"]
+    shown = image(frame)
+    tint(shown, area & ~suspect, (.36, .71, .95), .2)
+    tint(shown, groups["evidenced"], (.27, .79, .51))
+    tint(shown, groups["responsive"], (.93, .45, .27))
+    tint(shown, groups["pending"], (.95, .8, .3))
+    rows = []
+    for key, value in sets.items():
+        for slot in ("matte", "gloss"):
+            witness = value[slot]
+            rows.append({
+                "reference_set": key.upper(), "patch": witness["mark"]["title"], "role": slot,
+                "paired_pixels": witness["paired"],
+                "face_luma": round(witness["face"], 4) if witness["face"] is not None else None,
+                "crossed_luma": round(witness["crossed"], 4) if witness["crossed"] is not None else None,
+                "difference": round(witness["delta"], 4) if witness["delta"] is not None else None,
+                "set_contrast": round(value["contrast"], 4) if value["contrast"] is not None else None,
+                "set_qualified": "yes" if value["qualified"] else "no",
+                "adopted": "yes" if key == adopted else "no",
+            })
+            amount = .5 if key == adopted else .16
+            tint(shown, witness["mask"], (.91, .49, .39) if slot == "matte" else (.40, .75, .96), amount)
+    for name, label in (("evidenced", "Evidenced inclusion"), ("responsive", "Polarization-responsive"),
+                        ("pending", "Pending evidence")):
+        rows.append({"class": label, "pixels": counts[name],
+                     "percent_of_region": round(100 * counts[name] / total, 3)})
+    rows.append({"class": "Suspect total (possible)", "pixels": suspect_pixels,
+                 "percent_of_region": round(100 * suspect_pixels / total, 3)})
+    rows.append({"class": "Base-like", "pixels": total - suspect_pixels,
+                 "percent_of_region": round(100 * (total - suspect_pixels) / total, 3)})
+    spots.sort(key=lambda spot: spot["pixels"], reverse=True)
+    names = {"evidenced": "Evidenced inclusion", "responsive": "Polarization-responsive", "pending": "Pending evidence"}
+    for index, spot in enumerate(spots[:40], 1):
+        rows.append({"spot": index, "classification": names[spot["kind"]], "pixels": spot["pixels"],
+                     "paired_pixels": spot["paired"], "size_mm2": round(spot["size_mm2"], 4),
+                     "center_mm": rounded(spot["center"]),
+                     "response": round(spot["response"], 4) if spot["response"] is not None else None})
+    return {
+        "adopted_reference_set": adopted.upper(), "reference_priority": priority, "adopted_reason": reason,
+        "control_contrast": round(contrast, 4),
+        "inclusion_confirmed_pct": round(100 * counts["evidenced"] / total, 3),
+        "inclusion_possible_pct": round(100 * suspect_pixels / total, 3),
+        "polarization_responsive_pct": round(100 * counts["responsive"] / total, 3),
+        "pending_evidence_pct": round(100 * counts["pending"] / total, 3),
+        "inspection_pixels": total,
+        "region_paired_pct": round(100 * int((area & other.useful).sum()) / total, 3),
+        "candidate_spots": len(spots), "threshold": threshold,
+    }, rows, shown
 
 
 def lamina_spacing(frame, marks, _opts):

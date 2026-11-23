@@ -11,6 +11,8 @@ from .store import identity, stamp
 WIDTH, HEIGHT = 1040, 650
 CORNERS = [[0, 0], [1, 0], [1, 1], [0, 1]]
 LANDMARKS = [(142, 210), (907, 193), (153, 516), (903, 527)]
+CLASTS = ((317, 278, 31, 19), (386, 296, 41, 30), (463, 316, 26, 16), (543, 294, 32, 14))
+FLECKS = ((340, 312, 6, 4), (431, 283, 5, 4), (505, 274, 6, 4))
 CONTROLS = [
     ("Light inner matrix", "matrix", (207, 331, 293, 379)),
     ("Dark inclusion", "accent", (373, 282, 402, 307)),
@@ -19,6 +21,8 @@ CONTROLS = [
     ("Discolored outer wall", "inspect", (579, 394, 772, 532)),
     ("Low-response outer material", "matte", (684, 302, 765, 345)),
     ("High-response inner material", "gloss", (472, 258, 535, 300)),
+    ("Reserve low-response material", "matte", (160, 300, 225, 345)),
+    ("Reserve high-response material", "gloss", (556, 244, 620, 278)),
     ("Inclusion-bearing lamina", "decor", (305, 267, 575, 321)),
 ]
 
@@ -51,9 +55,6 @@ def exposed_section(role, shift, seed):
     pixels[inner] += np.array([17, 12, 4])
     shell_outer = material & (mouth > .88) & (y > 343)
     pixels[shell_outer] -= np.array([29, 39, 36])
-    for cx, cy, rx, ry in ((317, 278, 31, 19), (386, 296, 41, 30), (463, 316, 26, 16), (543, 294, 32, 14)):
-        clast = ((x-cx)/rx)**2 + ((y-cy)/ry)**2 < 1
-        pixels[clast] = np.array([98, 77, 82]) + fine[clast][:, None]
     weathered = np.clip((x - 809) / 37, 0, 1) * material * (y > 329) * (y < 473)
     pixels = pixels * (1 - weathered[:, :, None]) + np.array([104, 87, 78]) * weathered[:, :, None]
     if role == "cross":
@@ -61,6 +62,16 @@ def exposed_section(role, shift, seed):
         pixels += response[:, :, None] * np.array([1.10, 1.00, .78])
     elif role == "detail":
         pixels[material] += np.array((3, 1, -3))
+    # Dark inclusions keep their face color under crossed polarization; small flecks
+    # share that front color but brighten strongly, like reflective flakes.
+    for cx, cy, rx, ry in CLASTS:
+        clast = ((x-cx)/rx)**2 + ((y-cy)/ry)**2 < 1
+        pixels[clast] = np.array([98, 77, 82]) + fine[clast][:, None]
+    for cx, cy, rx, ry in FLECKS:
+        fleck = ((x-cx)/rx)**2 + ((y-cy)/ry)**2 < 1
+        pixels[fleck] = np.array([98, 77, 82]) + fine[fleck][:, None]
+        if role == "cross":
+            pixels[fleck] += np.array([64, 58, 42])
 
     rgba = cv.cvtColor(np.clip(pixels, 0, 255).astype(np.uint8), cv.COLOR_RGB2RGBA)
     for x0, y0, radius in ((238, 413, 6), (288, 447, 8), (337, 431, 5), (344, 491, 9), (391, 462, 4)):
